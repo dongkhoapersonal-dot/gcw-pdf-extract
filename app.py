@@ -3,6 +3,7 @@ import re
 import time
 import uuid
 import glob
+import gc
 
 from flask import Flask, request, jsonify
 import pdfplumber
@@ -116,6 +117,7 @@ def extract(job_id):
             tables = page.extract_tables()
             if not tables:
                 skipped_pages.append(page_index + 1)
+                page.flush_cache()
                 continue
             table = tables[0]
             for raw_row in table:
@@ -137,6 +139,14 @@ def extract(job_id):
                     "Ty_le_no": clean_number(clean_cell(raw_row[7])),
                     "So_tien_cham_dong": clean_number(clean_cell(raw_row[8])),
                 })
+            # pdfplumber caches parsed chars/rects/etc. per page and never
+            # releases them on its own -- across many requests in the same
+            # long-lived worker this leaks memory until the free-tier
+            # instance gets OOM-killed. Flush explicitly after each page.
+            page.flush_cache()
+
+    del pdf
+    gc.collect()
 
     return jsonify({
         "job_id": job_id,
