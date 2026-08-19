@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --max-requests 20 --max-requests-jitter 5"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --max-requests 60 --max-requests-jitter 10"
     envVars:
       - key: API_KEY
         generateValue: true
