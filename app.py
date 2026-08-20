@@ -4,6 +4,7 @@ import time
 import uuid
 import glob
 import gc
+import threading
 
 from flask import Flask, request, jsonify
 import pdfplumber
@@ -17,7 +18,14 @@ API_KEY = os.environ.get("API_KEY", "changeme")
 
 JOB_DIR = "/tmp/pdf_jobs"
 os.makedirs(JOB_DIR, exist_ok=True)
-JOB_TTL_SECONDS = 3600  # cached PDFs older than this get cleaned up
+JOB_TTL_SECONDS = 3600  # cached PDFs / finished jobs older than this get cleaned up
+
+# In-memory job registry. A background thread processes the whole PDF once
+# (opened a single time) instead of n8n calling us once per page-range --
+# re-opening a 590-page PDF for every small chunk was the real bottleneck,
+# not the page-extraction work itself.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
 
 def cleanup_old_jobs():
@@ -28,6 +36,10 @@ def cleanup_old_jobs():
                 os.remove(path)
         except OSError:
             pass
+    with JOBS_LOCK:
+        stale = [jid for jid, j in JOBS.items() if now - j.get("created_at", now) > JOB_TTL_SECONDS]
+        for jid in stale:
+            JOBS.pop(jid, None)
 
 
 def clean_cell(value):
@@ -60,6 +72,66 @@ def check_auth():
     return request.headers.get("X-API-Key") == API_KEY
 
 
+def process_pdf(job_id, path):
+    rows = []
+    skipped_pages = []
+    try:
+        with pdfplumber.open(path) as pdf:
+            total_pages = len(pdf.pages)
+            with JOBS_LOCK:
+                JOBS[job_id]["total_pages"] = total_pages
+
+            for page_index, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                if not tables:
+                    skipped_pages.append(page_index + 1)
+                else:
+                    table = tables[0]
+                    for raw_row in table:
+                        if not raw_row or len(raw_row) < 9:
+                            continue
+                        if looks_like_header(raw_row):
+                            continue
+                        stt_raw = clean_cell(raw_row[0])
+                        if not stt_raw or not stt_raw.isdigit():
+                            continue
+                        rows.append({
+                            "STT": int(stt_raw),
+                            "BHXH_co_so_quan_ly": clean_cell(raw_row[1]),
+                            "Ma_don_vi": clean_cell(raw_row[2]),
+                            "Ten_don_vi": clean_cell(raw_row[3]),
+                            "Dia_chi": clean_cell(raw_row[4]),
+                            "So_lao_dong": clean_number(clean_cell(raw_row[5])),
+                            "So_thang_no": clean_number(clean_cell(raw_row[6])),
+                            "Ty_le_no": clean_number(clean_cell(raw_row[7])),
+                            "So_tien_cham_dong": clean_number(clean_cell(raw_row[8])),
+                        })
+
+                page.flush_cache()
+
+                with JOBS_LOCK:
+                    JOBS[job_id]["pages_done"] = page_index + 1
+
+                if (page_index + 1) % 15 == 0:
+                    gc.collect()
+
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "done"
+            JOBS[job_id]["rows"] = rows
+            JOBS[job_id]["skipped_pages"] = skipped_pages
+
+    except Exception as exc:  # noqa: BLE001
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = str(exc)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        gc.collect()
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -84,79 +156,43 @@ def upload():
     with open(path, "wb") as f:
         f.write(pdf_bytes)
 
-    try:
-        with pdfplumber.open(path) as pdf:
-            page_count = len(pdf.pages)
-    except Exception as exc:  # noqa: BLE001
-        os.remove(path)
-        return jsonify({"error": f"invalid pdf: {exc}"}), 400
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "processing",
+            "pages_done": 0,
+            "total_pages": None,
+            "rows": None,
+            "created_at": time.time(),
+        }
 
-    return jsonify({"job_id": job_id, "page_count": page_count})
+    thread = threading.Thread(target=process_pdf, args=(job_id, path), daemon=True)
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "processing"})
 
 
-@app.route("/extract/<job_id>", methods=["GET"])
-def extract(job_id):
+@app.route("/status/<job_id>", methods=["GET"])
+def status(job_id):
     if not check_auth():
         return jsonify({"error": "unauthorized"}), 401
 
-    path = os.path.join(JOB_DIR, f"{job_id}.pdf")
-    if not os.path.exists(path):
-        return jsonify({"error": "unknown or expired job_id"}), 404
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "unknown or expired job_id"}), 404
+        resp = {
+            "status": job["status"],
+            "pages_done": job["pages_done"],
+            "total_pages": job.get("total_pages"),
+        }
+        if job["status"] == "done":
+            resp["count"] = len(job["rows"])
+            resp["skipped_pages"] = job.get("skipped_pages", [])
+            resp["rows"] = job["rows"]
+        elif job["status"] == "error":
+            resp["error"] = job.get("error")
 
-    start = int(request.args.get("start", 1))
-    end = int(request.args.get("end", start))
-
-    rows = []
-    skipped_pages = []
-
-    with pdfplumber.open(path) as pdf:
-        total_pages = len(pdf.pages)
-        end = min(end, total_pages)
-        for page_index in range(start - 1, end):
-            page = pdf.pages[page_index]
-            tables = page.extract_tables()
-            if not tables:
-                skipped_pages.append(page_index + 1)
-                page.flush_cache()
-                continue
-            table = tables[0]
-            for raw_row in table:
-                if not raw_row or len(raw_row) < 9:
-                    continue
-                if looks_like_header(raw_row):
-                    continue
-                stt_raw = clean_cell(raw_row[0])
-                if not stt_raw or not stt_raw.isdigit():
-                    continue
-                rows.append({
-                    "STT": int(stt_raw),
-                    "BHXH_co_so_quan_ly": clean_cell(raw_row[1]),
-                    "Ma_don_vi": clean_cell(raw_row[2]),
-                    "Ten_don_vi": clean_cell(raw_row[3]),
-                    "Dia_chi": clean_cell(raw_row[4]),
-                    "So_lao_dong": clean_number(clean_cell(raw_row[5])),
-                    "So_thang_no": clean_number(clean_cell(raw_row[6])),
-                    "Ty_le_no": clean_number(clean_cell(raw_row[7])),
-                    "So_tien_cham_dong": clean_number(clean_cell(raw_row[8])),
-                })
-            # pdfplumber caches parsed chars/rects/etc. per page and never
-            # releases them on its own -- across many requests in the same
-            # long-lived worker this leaks memory until the free-tier
-            # instance gets OOM-killed. Flush explicitly after each page.
-            page.flush_cache()
-
-    del pdf
-    gc.collect()
-
-    return jsonify({
-        "job_id": job_id,
-        "start": start,
-        "end": end,
-        "total_pages": total_pages,
-        "count": len(rows),
-        "skipped_pages": skipped_pages,
-        "rows": rows,
-    })
+    return jsonify(resp)
 
 
 @app.route("/job/<job_id>", methods=["DELETE"])
@@ -166,6 +202,8 @@ def delete_job(job_id):
     path = os.path.join(JOB_DIR, f"{job_id}.pdf")
     if os.path.exists(path):
         os.remove(path)
+    with JOBS_LOCK:
+        JOBS.pop(job_id, None)
     return jsonify({"deleted": True})
 
 
